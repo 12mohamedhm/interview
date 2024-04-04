@@ -1,121 +1,146 @@
-import { EventEmitter } from 'events'
-import { WebSocket } from 'ws'
+import { EventEmitter } from 'events';
+import { WebSocket } from 'ws';
 
 interface SocketMessage {
-	event: 'media' | 'mark' | 'clear';
-	media?: {
-		payload: string
-	}
-	mark?: {
-		name: string
-	}
+	event: 'media' | 'mark' | 'clear'; 
+  	media?: {
+    	payload: string;
+    	durationMs: number; // Duration of this audio packet in milliseconds, can also be explicitly calculated using Samples/Sample rate, samples = packet size/bit depth
+  	};
+  	mark?: {
+    		name: string;
+  	};
 }
 
 interface CallMediaQueueArgs {
-	streamSid: string;
-	socket: WebSocket
+  	streamSid: string;
+  	socket: WebSocket;
 }
 
 class CallMediaQueue extends EventEmitter {
+  
+	private queue: SocketMessage[]; 
+  	private isSending: boolean;
+  	private streamSid: string;
+  	private socket: WebSocket;
+    	private currentVolume: number = 1.0; // Current volume at 100%
 
-	private queue: SocketMessage[]
-	private isSending: boolean
-	private streamSid: string
-	private socket: WebSocket
+  	constructor(args: CallMediaQueueArgs) {
+    		super();
+    		this.queue = [];
+    		this.isSending = false;
+    		this.streamSid = args.streamSid;
+    		this.socket = args.socket;
 
-	constructor(args: CallMediaQueueArgs) {
-		super()
-		this.queue = []
-		this.isSending = false
-		this.streamSid = args.streamSid
-		this.socket = args.socket
+    		this.socket.on('message', async (message) => {
+      			const data = JSON.parse(message.toString());
+      
+      			if (data.event === 'mark') {
+        			this.emit('mark', data.mark.name); // Emit a 'mark' event with the name
+      				}
+    		});
+  	}
 
-		this.socket.on('message', async (message) => {
-			const data = JSON.parse(message.toString())
+  // Process the next message in the queue
+  	private async processNext(): Promise<void> {
+    		if (!this.isSending && this.queue.length > 0) {
+      			this.isSending = true;
+     			await this.sendNext(); // Send the next message
+    		}
+  	}
 
-			switch (data.event) {
-				case 'mark': {
-					this.emit('mark', data.mark.name)
-					break
-				}
-			}
-		})
+  // Send the next message in the queue
+  	private async sendNext(): Promise<void> {
+    		if (this.queue.length === 0) {
+      			this.isSending = false; // Reset the sending flag
+      			return; // Exit the function
+    		}
+
+    	const socketMessage = this.queue.shift()!;
+    	try {
+      		// Attempt to send the message with retries
+      		await this.sendWithRetry(socketMessage);
+      		const delayDuration = socketMessage.media?.durationMs || 0; // If successful, wait for the duration of the audio clip before sending the next one
+      		await new Promise(resolve => setTimeout(resolve, delayDuration));
+    	} 	catch (error) {
+      		console.error('Failed to send packet after retries:', error); // Log the error if all retries fail
+    		}
+
+    	this.isSending = false;
+    	this.processNext();
+  }
+
+  	// Attempt to send a message with retries in case of failure
+  	private async sendWithRetry(socketMessage: SocketMessage, retries: number = 3, delay: number = 300): Promise<void> {
+    		for (let attempt = 1; attempt <= retries; attempt++) {
+      			try {
+       			 	// Try to send the message
+        			await this.sendToTwilio(socketMessage);
+        			return; // Exit the function upon success
+      			} 	catch (error) {
+        			// Log the error and retry after a delay
+        			console.error(`Attempt ${attempt} failed, retrying...`, error);
+        			if (attempt < retries) {
+          				// Wait for the specified delay before retrying
+          				await new Promise(resolve => setTimeout(resolve, delay));
+        			}
+      			}
+    		}
+    	// If all retries fail, throw an error
+    	throw new Error(`Failed to send packet after ${retries} retries.`);
+  	}
+  	// Send a message to Twilio (or any WebSocket server)
+  	private async sendToTwilio(socketMessage: SocketMessage): Promise<void> {
+    		return new Promise((resolve, reject) => {
+      	// Send the message via WebSocket
+      			this.socket.send(JSON.stringify({
+        			event: socketMessage.event,
+        			streamSid: this.streamSid,
+        			media: socketMessage.media,
+        			mark: socketMessage.mark,
+      				}), error => {
+        			if (error) reject(error); // Reject
+        			else resolve(); // Otherwise, resolve the promise
+      			});
+    		});
+  	}
+
+  	public enqueue(mediaData: SocketMessage): void {
+    		this.queue.push(mediaData); 
+    		this.processNext(); 
+  	}
+
+  	public media(payload: string, durationMs: number): void {
+    		this.enqueue({
+      			event: 'media',
+      			media: {
+        			payload,
+        			durationMs
+      			},
+    		});
+  	}
+
+  	public mark(name: string): void {
+    		this.enqueue({
+      			event: 'mark',
+      			mark: { name },
+    		});
+  	}
+
+  	public clear(): void {
+    		this.sendToTwilio({ event: 'clear' });
+    		this.queue = [];
+  		}
 	}
 
-	private processNext(): void {
-		if (!this.isSending && this.queue.length > 0) {
-			this.isSending = true
-			this.sendNext()
-		}
-	}
+    setVolume(volume: number): void {
+        if (volume < 0 || volume > 1) {
+            throw new Error('Volume must be between 0 and 1');
+        }
+        this.currentVolume = volume;
 
-	private sendNext(): void {
-		if (this.queue.length === 0) {
-			this.isSending = false
-			return
-		}
+    	private async sendNext(): Promise<void> {
 
-		const socketMessage = this.queue.shift()
+export default CallMediaQueue;
 
-		this.sendToTwilio(socketMessage)
 
-		this.isSending = false
-		this.processNext()
-	}
-
-	// Sends audio to Twilio as it arrives– faster than real-time
-	private sendToTwilio(socketMessage: SocketMessage) {
-		this.socket.send(
-			JSON.stringify({
-				event: socketMessage.event,
-				streamSid: this.streamSid,
-				media: socketMessage.media,
-				mark: socketMessage.mark,
-			})
-		)
-	}
-
-	private clearQueue(): void {
-		this.queue = []
-	}
-
-	private enqueue(mediaData: SocketMessage): void {
-		this.queue.push(mediaData)
-		this.processNext()
-	}
-
-	// New audio payload available
-	media(payload: string): void {
-		this.enqueue({
-			event: 'media',
-			media: {
-				payload,
-			},
-		})
-	}
-
-	// Mark a point in the audio stream since Twilio handles the audio buffer and we can't control the timing
-	// Once we send audio in real-time, we can remove this method or use it locally.\
-	mark(name: string): void {
-		this.enqueue({
-			event: 'mark',
-			mark: {
-				name,
-			},
-		})
-	}
-
-	// Clear the audio queue with Twilio. When we send in real-time, we can remove this method or use it locally.
-	clear(): void {
-		this.sendToTwilio({ event: 'clear' })
-		this.clearQueue()
-	}
-
-	// Set the volume of the audio stream, 0-1
-	setVolume(volume: number): void {
-		// Part B
-	}
-
-}
-
-export default CallMediaQueue
